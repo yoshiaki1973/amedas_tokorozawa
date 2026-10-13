@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>所沢 アメダス</title>
+<style>
+  :root { --bg:#fff; --fg:#1f2328; --sub:#656d76; --line:#d0d7de; --card:#f6f8fa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0d1117; --fg:#e6edf3; --sub:#8b949e; --line:#30363d; --card:#161b22; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,"Hiragino Sans","Yu Gothic",Meiryo,sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  #status { color:var(--sub); font-size:13px; margin-bottom:12px; }
+  #status.error { color:#cf222e; white-space:pre-wrap; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; font-size:14px; }
+  .controls input, .controls button { font:inherit; padding:4px 8px; border:1px solid var(--line);
+         border-radius:6px; background:var(--card); color:var(--fg); }
+  .controls button { cursor:pointer; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-bottom:12px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  .stat .l { font-size:12px; color:var(--sub); }
+  .stat .v { font-size:18px; font-weight:600; }
+  .chart { position:relative; height:220px; margin-bottom:8px; }
+  .chart.tall { height:260px; }
+</style>
+</head>
+<body>
+<h1>所沢 アメダス</h1>
+<div id="status">読み込み中…</div>
+
+<div class="controls">
+  <label>開始 <input type="datetime-local" id="from"></label>
+  <label>終了 <input type="datetime-local" id="to"></label>
+  <button data-days="1">直近1日</button>
+  <button data-days="3">直近3日</button>
+  <button data-days="7">直近7日</button>
+  <button data-days="0">全期間</button>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="chart tall"><canvas id="cTemp"></canvas></div>
+<div class="chart"><canvas id="cHum"></canvas></div>
+<div class="chart"><canvas id="cRain"></canvas></div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const CSV_URL = 'https://amedas-tokorozawa-yk2026.s3.ap-northeast-1.amazonaws.com/amedas_tokorozawa.csv';
+const STEP_MS = 10 * 60 * 1000;      // 観測間隔（10分）
+const statusEl = document.getElementById('status');
+
+let rows = [];     // {t, rain, temp, hum}
+let charts = {};
+
+const pad = n => String(n).padStart(2, '0');
+const fmt = t => { const d = new Date(t); return `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const toInput = t => { const d = new Date(t); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const num = s => (s === undefined || s.trim() === '' || isNaN(Number(s))) ? null : Number(s);
+
+function parseCsv(text) {
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(l => l.trim());
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {           // 1行目はヘッダー
+    const [dt, rain, temp, hum] = lines[i].split(',');
+    const t = new Date(dt.trim().replace(' ', 'T')).getTime();
+    if (isNaN(t)) continue;
+    out.push({ t, rain: num(rain), temp: num(temp), hum: num(hum) });
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+// 欠測（10分より空いた区間）で線を切るため null を挟む
+function lineData(key) {
+  const d = [];
+  rows.forEach((r, i) => {
+    if (i > 0 && r.t - rows[i-1].t > STEP_MS * 1.5) d.push({ x: rows[i-1].t + 1, y: null });
+    d.push({ x: r.t, y: r[key] });
+  });
+  return d;
+}
+
+function makeChart(id, type, label, key, color, yTitle, extra = {}) {
+  const ds = type === 'bar'
+    ? { label, data: rows.map(r => ({ x: r.t, y: r[key] })), backgroundColor: color, borderWidth: 0,
+        barPercentage: 1, categoryPercentage: 1 }
+    : { label, data: lineData(key), borderColor: color, backgroundColor: color, borderWidth: 1.5,
+        pointRadius: 0, pointHitRadius: 6, spanGaps: true, tension: 0 };
+  return new Chart(document.getElementById(id), {
+    type,
+    data: { datasets: [ds] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+      interaction: { mode: 'nearest', axis: 'x', intersect: false },
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: label },
+        tooltip: { callbacks: { title: items => fmt(items[0].parsed.x) } }
+      },
+      scales: {
+        x: { type: 'linear', ticks: { maxTicksLimit: 8, callback: v => fmt(v) } },
+        y: { title: { display: true, text: yTitle }, afterFit: s => { s.width = 60; }, ...extra }
+      }
+    }
+  });
+}
+
+function setRange(from, to) {
+  for (const c of Object.values(charts)) {
+    c.options.scales.x.min = from;
+    c.options.scales.x.max = to;
+    c.update('none');
+  }
+  document.getElementById('from').value = toInput(from);
+  document.getElementById('to').value = toInput(to);
+  updateStats(from, to);
+}
+
+function updateStats(from, to) {
+  const sel = rows.filter(r => r.t >= from && r.t <= to);
+  const temps = sel.map(r => r.temp).filter(v => v !== null);
+  const hums  = sel.map(r => r.hum).filter(v => v !== null);
+  const rainSum = sel.reduce((s, r) => s + (r.rain || 0), 0);
+  const rainMax = Math.max(0, ...sel.map(r => r.rain || 0));
+  const items = [
+    ['最高気温', temps.length ? Math.max(...temps).toFixed(1) + ' ℃' : '-'],
+    ['最低気温', temps.length ? Math.min(...temps).toFixed(1) + ' ℃' : '-'],
+    ['平均湿度', hums.length ? (hums.reduce((a, b) => a + b, 0) / hums.length).toFixed(0) + ' %' : '-'],
+    ['期間降水量（観測分の合計）', rainSum.toFixed(1) + ' mm'],
+    ['最大10分降水量', rainMax.toFixed(1) + ' mm'],
+    ['観測点数', sel.length + ' 件']
+  ];
+  document.getElementById('stats').innerHTML =
+    items.map(([l, v]) => `<div class="stat"><div class="l">${l}</div><div class="v">${v}</div></div>`).join('');
+}
+
+function applyInputs() {
+  const f = new Date(document.getElementById('from').value).getTime();
+  const t = new Date(document.getElementById('to').value).getTime();
+  if (!isNaN(f) && !isNaN(t) && f < t) setRange(f, t);
+}
+
+async function main() {
+  try {
+    const res = await fetch(CSV_URL, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    rows = parseCsv(await res.text());
+    if (!rows.length) throw new Error('CSVにデータ行がありません');
+  } catch (e) {
+    statusEl.className = 'error';
+    statusEl.textContent = 'CSVの取得に失敗しました: ' + e.message +
+      '\nS3バケットのCORS設定（GETを許可）が必要な可能性があります。';
+    return;
+  }
+
+  const first = rows[0].t, last = rows[rows.length - 1].t;
+  statusEl.textContent = `${fmt(first)} 〜 ${fmt(last)}（${rows.length} 件）`;
+
+  charts.temp = makeChart('cTemp', 'line', '気温 (℃)', 'temp', '#e5484d', '℃');
+  charts.hum  = makeChart('cHum',  'line', '湿度 (%)', 'hum',  '#0969da', '%', { min: 0, max: 100 });
+  charts.rain = makeChart('cRain', 'bar',  '降雨量 10分 (mm)', 'rain', '#1a7f37', 'mm', { beginAtZero: true });
+
+  setRange(first, last);
+
+  document.getElementById('from').addEventListener('change', applyInputs);
+  document.getElementById('to').addEventListener('change', applyInputs);
+  document.querySelectorAll('button[data-days]').forEach(b => b.addEventListener('click', () => {
+    const days = Number(b.dataset.days);
+    setRange(days ? Math.max(first, last - days * 86400000) : first, last);
+  }));
+}
+main();
+</script>
+</body>
+</html>
